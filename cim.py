@@ -33,6 +33,7 @@ import hashlib
 import threading
 import subprocess
 import optparse
+from turtle import left, title
 
 try:
     from BaseHTTPServer import BaseHTTPRequestHandler, HTTPServer
@@ -57,7 +58,7 @@ try:
 except ImportError:
     curses = None
 
-VERSION = "0.2"
+VERSION = "0.1"
 DEFAULT_PORT = 8271
 BLOCK = 512
 PER_PAGE = 16            # disks: what Image Manager serves; the card holds 18
@@ -150,14 +151,15 @@ def encode_path(rel):
 
 
 def json_str(s):
+    """JSON string literal, with quotes and escapes. UTF-8 text in, text out."""
     out = [u'"']
     for ch in s:
         if ch == u'"':
-            out.append(u'\\"')
+            out.append(u'\\"') # escape double quote
         elif ch == u"\\":
-            out.append(u"\\\\")
+            out.append(u"\\\\") # escape backslash
         elif ord(ch) < 0x20:
-            out.append(u"\\u%04X" % ord(ch))
+            out.append(u"\\u%04X" % ord(ch)) # magic control characters
         else:
             out.append(ch)
     out.append(u'"')
@@ -165,18 +167,22 @@ def json_str(s):
 
 
 def lower_key(s):
+    """Returns lower-case when asked."""
     return s.lower()
 
 
 def last_component(path):
+    """Last path component, or empty string if path is empty."""
     return path.split(u"/")[-1] if path else u""
 
 
 def now_hms():
+    """Current time as HH:MM:SS string."""
     return time.strftime("%H:%M:%S")
 
 
 def makedirs(p):
+    """Like os.makedirs but ignores existing directories."""
     if not os.path.isdir(p):
         try:
             os.makedirs(p)
@@ -185,6 +191,7 @@ def makedirs(p):
 
 
 def file_size(p):
+    """Return the size of a file in bytes, or None if it does not exist."""
     try:
         return os.path.getsize(p)
     except OSError:
@@ -214,6 +221,7 @@ def run_quiet(args):
 
 
 def which(name, extra=()):
+    """Return the absolute path of an executable, or None if not found."""
     paths = list(extra) + os.environ.get("PATH", "").split(os.pathsep) + [
         "/usr/local/bin", "/opt/homebrew/bin", "/opt/local/bin", "/sw/bin", "/usr/bin"]
     for d in paths:
@@ -246,6 +254,7 @@ def clean_name(file_name):
 
 
 def read_le32(d, off):
+    """Read a little-endian 32-bit integer from a bytes object, or 0 if not enough bytes."""
     if len(d) < off + 4:
         return 0
     return (byte_at(d, off) | (byte_at(d, off + 1) << 8) |
@@ -309,6 +318,7 @@ class DiskImage(object):
 
 
 def probe_disk(path, folder, file_name):
+    """Return a DiskImage or None if not a valid disk image."""
     ext = os.path.splitext(file_name)[1][1:].lower()
     if ext not in DISK_EXT:
         return None
@@ -1829,6 +1839,7 @@ def fmt_mb(n):
 
 class Tui(object):
     def __init__(self, scr, lib):
+        """Initialize the text-based user interface with the given curses screen and library."""
         self.scr = scr
         self.lib = lib
         self.expanded = set([u""])
@@ -1844,12 +1855,15 @@ class Tui(object):
         if curses.has_colors():
             curses.start_color()
             try:
+                # Trying to set up curses colors is a pain in the ass: some terminals don't support default colors, some do but don't support init_pair() with -1, and some do but don't support bold. 
+                # So we try the best we can, and fall back to a safe set of colors if anything fails.
                 curses.use_default_colors()
-                curses.init_pair(1, curses.COLOR_GREEN, -1)
-                curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_GREEN)
+                curses.init_pair(1, curses.COLOR_WHITE, -1)
+                curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_WHITE)
                 curses.init_pair(3, curses.COLOR_YELLOW, -1)
                 curses.init_pair(4, curses.COLOR_WHITE, -1)
             except curses.error:
+                # Terminal compatibility is a 55-gallon drum of worms and this is the can opener
                 curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
                 curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_GREEN)
                 curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK)
@@ -1859,12 +1873,14 @@ class Tui(object):
         scr.keypad(1)
 
     def attr(self, n, bold=False):
+        """Return the curses attribute for the given color pair number, with optional bold."""
         a = self.color and curses.color_pair(n) or 0
         if bold:
             a |= curses.A_BOLD
         return a
 
     def put(self, y, x, s, attr=0, width=None):
+        """Put a string at the given coordinates, with optional attributes and width limit."""
         h, w = self.scr.getmaxyx()
         if y < 0 or y >= h or x >= w:
             return
@@ -1878,23 +1894,73 @@ class Tui(object):
         except curses.error:
             pass
 
-    def hline(self, y, title=None):
-        h, w = self.scr.getmaxyx()
-        line = u"+" + u"-" * (w - 2) + u"+"
-        if title:
-            t = u" %s " % title
-            pos = max(2, (w - len(t)) // 2)
-            line = line[:pos] + t + line[pos + len(t):]
-        self.put(y, 0, line, self.attr(1))
+    # Decided to spiff it up with fancy box-drawing characters, why not
 
+    # The text edition is meant to run on a Tiger PowerBook, a NAS over SSH, PuTTY and a Windows command prompt.
+    # Literal UTF-8 turns to garbage on a few of those while the ACS set draws the same lines through the terminal's own line-drawing mode and falls back to + | by itself.
+    # I <?> Unicode, it really makes you feel like a pile of [] sometimes though
+    # So let's use the ACS set and let the terminal do the work...
+
+    # Horizontal line
+    def hline(self, y, title=None, corners=False):
+        """Draw a horizontal line at the given y coordinate, with optional title and corners."""
+        _, w = self.scr.getmaxyx()
+        if w < 2:
+            return
+
+        attr = self.attr(1)
+        # Use ULCORNER if corners, otherwise use LTEE/RTEE for a tee.
+        left = curses.ACS_ULCORNER if corners else curses.ACS_LTEE
+        right = curses.ACS_URCORNER if corners else curses.ACS_RTEE
+
+        self.scr.addch(y, 0, left | attr)
+        self.scr.hline(y, 1, curses.ACS_HLINE | attr, w - 2)
+        self.scr.addch(y, w - 1, right | attr)
+
+        if title:
+            text = (u" %s " % title)[:w - 2]
+            if text:
+                x = max(1, (w - len(text)) // 2) # divides by 2, to center the text
+                self.scr.addstr(y, x, text, attr)
+
+    def vline(self, y, x):
+        """Draw a vertical line at the given x coordinate, from y to the bottom of the screen."""
+        h, w = self.scr.getmaxyx()
+        if y < 0 or y >= h or x < 0 or x >= w:
+            return
+        try:
+            self.scr.addch(y, x, curses.ACS_VLINE | self.attr(1))
+        except curses.error:
+            pass
+
+    # Box sides
     def box_sides(self, y0, y1):
+        """Draw vertical lines at the left and right edges of the screen, from y0 to y1."""
         h, w = self.scr.getmaxyx()
         for y in range(y0, y1):
-            self.put(y, 0, u"|", self.attr(1))
-            self.put(y, w - 1, u"|", self.attr(1))
+            if y < 0 or y >= h:
+                continue
+            for x in (0, w - 1):
+                self.vline(y, x)
+
+    def bottomLine(self, y, corners=False):
+        """Draw a horizontal line at the bottom of the screen, with corners upon request."""
+        _, w = self.scr.getmaxyx()
+        if w < 2:
+            return
+
+        attr = self.attr(1)
+        # |_ and _| 
+        left = curses.ACS_LLCORNER if corners else curses.ACS_LTEE
+        right = curses.ACS_LRCORNER if corners else curses.ACS_RTEE
+
+        self.scr.addch(y, 0, left | attr)
+        self.scr.hline(y, 1, curses.ACS_HLINE | attr, w - 2)
+        self.scr.addch(y, w - 1, right | attr)
 
     # -- tree rows: (path, depth, has_children)
     def tree_rows(self):
+        """Return a list of all paths in the library, with their depth and whether they have children."""
         lib = self.lib
         folders = lib.folders
         children = {}
@@ -1904,15 +1970,18 @@ class Tui(object):
         rows = []
 
         def add(path, depth):
+            """Add a path and its children to the rows list."""
             kids = children.get(path, [])
             rows.append((path, depth, bool(kids)))
             if path in self.expanded:
                 for k in kids:
+                    # Using "kids" instead of "children" to avoid munging up the outer variable
                     add(k, depth + 1)
         add(u"", 0)
         return rows
 
     def draw(self):
+        """Draw the whole screen. Called on a timer and after any keypress."""
         scr = self.scr
         scr.erase()
         h, w = scr.getmaxyx()
@@ -1929,36 +1998,40 @@ class Tui(object):
             self.hline(h - 2)
             self.put(h - 1, 1, u" L back   Q quit ", self.attr(2))
             return
-        # header
-        self.hline(0)
-        title = u" ] CoGS IMAGE MANAGER  text edition v%s" % VERSION
-        self.put(1, 0, u"|", self.attr(1))
-        self.put(1, 1, title, self.attr(1, True))
+        # Draw the fancy header
+        title = u" CoGS Image Manager: Text Edition v%s" % VERSION
+        self.hline(0, title, corners=True)
+        self.vline(1, 0)
+
+        # A clock is useful to ensure it's not hanged
         clock = time.strftime("%a %b %d  %H:%M:%S ")
         self.put(1, w - 1 - len(clock), clock, self.attr(1))
-        self.put(1, w - 1, u"|", self.attr(1))
+        self.vline(1, w - 1)
         self.hline(2)
+
+        # Draw the library info
+        # I'd really like to minimize the vline calls but the curses ACS set is a bit of a pain in the butt to work with
         url = lib.base_url_guess()
-        self.put(3, 0, u"|", self.attr(1))
+        self.vline(3, 0)
         self.put(3, 2, u"Image Source URL: ", self.attr(1))
         self.put(3, 20, url, self.attr(4, True))
         self.put(3, 22 + len(url), u"<- use for image source", self.attr(1))
-        self.put(3, w - 1, u"|", self.attr(1))
-        self.put(4, 0, u"|", self.attr(1))
+        self.vline(3, w - 1)
+        self.vline(4, 0)
         self.put(4, 2, u"Library: %s" % lib.root, self.attr(1), w - 4)
-        self.put(4, w - 1, u"|", self.attr(1))
-        self.put(5, 0, u"|", self.attr(1))
+        self.vline(4, w - 1)
+        self.vline(5, 0)
         nb = len([i for i in lib.disks.images if i.bootable])
         line = u"%d disk images (%d bootable)   %d tracks   %d pictures   %d files" % (
             len(lib.disks.images), nb, len(lib.audio.tracks), len(lib.pictures.tracks), len(lib.files))
         self.put(5, 2, line, self.attr(1), w - 4)
-        self.put(5, w - 1, u"|", self.attr(1))
-        self.put(6, 0, u"|", self.attr(1))
+        self.vline(5, w - 1)
+        self.vline(6, 0)
         state = u"Sharing: %s   Access: %s   Requests: %d   Served: %s" % (
             lib.sharing_state(), lib.writable and u"writable" or u"read-only", lib.requests,
             fmt_mb(lib.bytes_served))
         self.put(6, 2, state, self.attr(1), w - 4)
-        self.put(6, w - 1, u"|", self.attr(1))
+        self.vline(6, w - 1)
         extra = []
         if lib.converting:
             extra.append(u"converting: %s" % lib.converting)
@@ -1973,9 +2046,9 @@ class Tui(object):
             extra.append(u"%d .dsk/.do/.woz/.nib skipped (ProDOS order only)" % lib.rejected)
         row = 7
         if extra:
-            self.put(row, 0, u"|", self.attr(1))
+            self.vline(row, 0)
             self.put(row, 2, u"; ".join(extra), self.attr(3), w - 4)
-            self.put(row, w - 1, u"|", self.attr(1))
+            self.vline(row, w - 1)
             row += 1
         # panes
         log_h = max(4, min(8, (h - row - 6) // 3))
@@ -1985,7 +2058,7 @@ class Tui(object):
         self.box_sides(body_top, body_bot)
         tree_w = min(44, max(24, w // 2 - 2))
         for y in range(body_top, body_bot):
-            self.put(y, tree_w + 1, u"|", self.attr(1))
+            self.vline(y, tree_w + 1)
         rows = self.tree_rows()
         if self.sel >= len(rows):
             self.sel = max(0, len(rows) - 1)
@@ -2038,20 +2111,25 @@ class Tui(object):
             elif act != u"  ":
                 a = self.attr(3, True)
             self.put(body_top + i, x0, u"%s %s%s" % (kind, act, text), a, iw)
-        # log
-        self.hline(body_bot, u"LOG")
+        # Log pane
+        self.hline(body_bot, u"LOG") 
+        # What rolls down stairs, alone or in pairs, and over your neighbor's dog?
         lines = lib.log_lines[-(log_h):]
         for i in range(len(lines)):
-            self.put(body_bot + 1 + i, 0, u"|", self.attr(1))
+            self.vline(body_bot + 1 + i, 0)
             self.put(body_bot + 1 + i, 2, lines[i], self.attr(1), w - 4)
-            self.put(body_bot + 1 + i, w - 1, u"|", self.attr(1))
+            self.vline(body_bot + 1 + i, w - 1)
         self.box_sides(body_bot + 1 + len(lines), h - 2)
-        self.hline(h - 2)
+        self.bottomLine(h - 2, corners=True)
+
+        # Key legend.
+        # Maybe we could spiff it up? Trying to minimize terminal jank though
         keys = u" R Rescan  W Writable  B %s  C Category  P Prefix  L Log  ? Help  Q Quit " % (
             lib.sharing and u"Stop sharing" or u"Start sharing")
         self.put(h - 1, 1, keys, self.attr(2), w - 2)
 
     def items_in(self, folder, nw=30):
+        """Return a list of items in the given folder, each as (kind, text, key)."""
         lib = self.lib
         out = []
         for i in lib.disks.images:
@@ -2072,6 +2150,7 @@ class Tui(object):
         return out
 
     def draw_help(self):
+        """Draw the help screen."""
         h, w = self.scr.getmaxyx()
         self.hline(0, u"HELP")
         self.box_sides(1, h - 2)
@@ -2244,6 +2323,7 @@ def write(s):
 
 
 def run_plain(lib):
+    """Run a simple line-mode prompt for headless operation (launchd, cron, NAS)."""
     write(plain_status(lib))
     write(u"")
     write(u"Type ? for commands.")
@@ -2253,7 +2333,7 @@ def run_plain(lib):
             sys.stdout.flush()
             line = sys.stdin.readline()
         except KeyboardInterrupt:
-            return
+            return # no ^C traceback, just exit
         if not line:
             return
         line = fs_text(line).strip()
@@ -2262,17 +2342,19 @@ def run_plain(lib):
         cmd, _, arg = line.partition(u" ")
         cmd = cmd.lower()
         arg = arg.strip().strip(u"/")
-        if cmd in (u"q", u"quit", u"exit"):
+
+        # Headless commands
+        if cmd in (u"q", u"quit", u"exit"): # quit, exit (take notes, Vim...)
             return
-        elif cmd in (u"?", u"help", u"h"):
+        elif cmd in (u"?", u"help", u"h"): # help
             write(PLAIN_HELP)
-        elif cmd == u"s":
+        elif cmd == u"s": # status
             write(plain_status(lib))
-        elif cmd == u"t":
+        elif cmd == u"t": # tree
             write(plain_tree(lib))
-        elif cmd == u"l":
+        elif cmd == u"l": # list
             write(plain_list(lib, arg))
-        elif cmd == u"c" and arg:
+        elif cmd == u"c" and arg: # ???
             lib.hub.toggle(arg)
             lib.save_cfg()
             write(u"  category %s: %s" % (lib.hub.contains(arg) and u"on" or u"off", arg))
@@ -2280,16 +2362,16 @@ def run_plain(lib):
             lib.hub.prefix_subfolder = not lib.hub.prefix_subfolder
             lib.save_cfg()
             write(u"  prefix subfolder: %s" % (lib.hub.prefix_subfolder and u"on" or u"off"))
-        elif cmd == u"w":
+        elif cmd == u"w": # toggle writable / read-only
             lib.set_writable(not lib.writable)
             write(u"  share: %s" % (lib.writable and u"writable" or u"read-only"))
-        elif cmd == u"b":
+        elif cmd == u"b": # start / stop sharing
             lib.toggle_sharing()
             write(u"  sharing: %s" % lib.sharing_state())
-        elif cmd == u"r":
+        elif cmd == u"r": # Rescan the library
             lib.rescan(u"rescan")
             write(plain_status(lib))
-        elif cmd == u"g":
+        elif cmd == u"g": # show last 20 log lines
             write(u"\n".join(lib.log_lines[-20:]) or u"  (nothing yet)")
         else:
             write(u"  ? for commands")
@@ -2298,15 +2380,19 @@ def run_plain(lib):
 # ---------------------------------------------------------------- main
 
 def daemon_thread(target, args=()):
+    """Start a thread that will not block the process from exiting.
+    The thread is not joined, so it will be killed when the process exits."""
     t = threading.Thread(target=target, args=args)
     if hasattr(t, "daemon"):
         t.daemon = True            # 2.6+ / 3.x
     else:
         t.setDaemon(True)          # 2.5
+        # setDaemon is deprecated in 3.10, but we still need it for 2.5
     return t
 
 
 def main(argv):
+    """This is where the magic happens. Parse command-line options, start the server, and run the UI."""
     global LIB, HEADLESS
     op = optparse.OptionParser(
         usage="%prog [options] FOLDER",
@@ -2372,14 +2458,9 @@ def main(argv):
 
     # A closed Terminal window (SIGHUP) or a kill (SIGTERM) must take the
     # dns-sd child down with us, or the card keeps finding a dead share.
-    # Windows has no SIGHUP (0.2: the tuple below used to name it directly
-    # and died before the try; Taciano, Windows 11 / Python 3.14, 11-09).
     def on_signal(signum, frame):
         raise KeyboardInterrupt()
-    for name in ("SIGTERM", "SIGHUP"):
-        sig = getattr(signal, name, None)
-        if sig is None:
-            continue
+    for sig in (signal.SIGTERM, signal.SIGHUP):
         try:
             signal.signal(sig, on_signal)
         except (ValueError, OSError, AttributeError):
